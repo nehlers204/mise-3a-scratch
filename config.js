@@ -24,6 +24,10 @@ window.MISE_CONFIG = {
   // The tenant this throwaway install represents (matches tenants.id in shared).
   tenantId: "the-interim-test",
 
+  // The shared backend's app_state PK is (tenant_id, key), so the upsert must
+  // conflict-target both columns. Legacy silos omit this and default to "key".
+  appStateConflict: "tenant_id,key",
+
   // Labels the PWA install so it's obviously the test build.
   appName: "Mise (Shared 3a Test)"
 

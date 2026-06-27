@@ -9386,7 +9386,7 @@ async function _supabaseSet(key, value) {
     });
     return;
   }
-  await fetch(`${SUPABASE_URL}/rest/v1/app_state?on_conflict=tenant_id,key`, {
+  await fetch(`${SUPABASE_URL}/rest/v1/app_state?on_conflict=${APP_STATE_CONFLICT}`, {
     method: "POST",
     headers: {
       apikey: SUPABASE_ANON,
@@ -9487,6 +9487,13 @@ function _cartSet(c) {
 // preview / local dev with no config.js. Must equal this silo's tenants.id row
 // (its slug) so tenants.settings reads/writes resolve to the right row.
 const TENANT_ID = window.MISE_CONFIG.tenantId || "default";
+
+// The app_state upsert conflict target. Must match the backend's actual unique
+// constraint: legacy per-silo backends have PK (key) alone -> "key"; the shared
+// multi-tenant backend has PK (tenant_id, key) -> "tenant_id,key". Sourced from
+// config.js per deployment; defaults to "key" so a silo that hasn't set it keeps
+// working against its legacy backend (safe default = current production behavior).
+const APP_STATE_CONFLICT = window.MISE_CONFIG.appStateConflict || "key";
 
 async function fbSubmit({ rating, comment, cocktail_id, cocktail_name }) {
   if (!SUPABASE_URL || !SUPABASE_ANON) return null;
