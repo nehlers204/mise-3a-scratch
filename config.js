@@ -15,7 +15,8 @@ window.MISE_CONFIG = {
   // Phase 3b-1: the bar's published-menu token. LEAVE EMPTY for the first deploy.
   // Sign in as head -> Settings -> Published Menu -> "Publish Menu". That generates
   // and displays the token; paste it here, redeploy, then reload as a guest.
-  publishToken: "",
+  publishToken: "a2d69723b7734767828be4af6630a4da4a2f30f203e241c289bb3b5c8cfd58ef
+",
 
   appName: "Mise (Shared 3b Test)"
 };
