@@ -9495,6 +9495,12 @@ const TENANT_ID = window.MISE_CONFIG.tenantId || "default";
 // working against its legacy backend (safe default = current production behavior).
 const APP_STATE_CONFLICT = window.MISE_CONFIG.appStateConflict || "key";
 
+// The bar's stable published-menu capability token (Phase 3b). Guests read the
+// public-safe snapshot via get_published_menu(this). Empty until the head's
+// first Publish generates it and it's pasted into config.js; while empty, the
+// guest path no-ops and the menu falls back to defaults (graceful pre-publish).
+const PUBLISH_TOKEN = window.MISE_CONFIG.publishToken || "";
+
 async function fbSubmit({ rating, comment, cocktail_id, cocktail_name }) {
   if (!SUPABASE_URL || !SUPABASE_ANON) return null;
   if (!Number.isInteger(rating) || rating < 1 || rating > 5) return null;
@@ -9705,6 +9711,134 @@ function gSt(g, it) {
   if (r / mx <= LOW) return "low";
   return "full";
 }
+// ============================================================================
+// Guest-surface publish/read (Phase 3b-1). The published_menu snapshot is the
+// ONLY thing a guest reads. The publish step is a one-way PUBLIC-SAFE filter:
+// recipes + availability YES; costs, raw inventory, PII NO. The sanitizers below
+// are self-tested in isolation (see commit notes) — getting them right is the
+// leak-proof core of the whole guest surface.
+// ============================================================================
+
+// Strip the sensitive fields from an ingredient for the public snapshot. The
+// sensitive surface on an ingredient is exactly the wholesale-cost fields
+// (cost/costEst/costUnit); inventory (rw/rm) lives in `inv`, handled separately.
+// Denylist (not allowlist) so descriptive wine/beer display fields can't be
+// accidentally dropped; the name-guard defensively catches any future
+// cost/price/supplier-named field.
+function sanitizeIngForPublish(g) {
+  if (!g || typeof g !== "object") return g;
+  const out = {};
+  for (const k of Object.keys(g)) {
+    if (k === "cost" || k === "costEst" || k === "costUnit") continue;
+    if (/cost|price|wholesale|supplier|vendor|margin/i.test(k)) continue;
+    out[k] = g[k];
+  }
+  return out;
+}
+
+// Per-ingredient stock STATUS ("full"|"low"|"empty") computed at publish time,
+// so the guest gets availability without raw counts. gSt reads g.unit/qw/ml/qty
+// (kept in the sanitized ing) and it.rw/it.rm (the sensitive counts, dropped).
+function buildPublicInvStatus(ings, inv) {
+  const out = {};
+  (ings || []).forEach(g => { if (g && g.id) out[g.id] = gSt(g, (inv || {})[g.id]); });
+  return out;
+}
+
+// Rebuild a synthetic `inv` on the GUEST side that makes gSt() return the
+// published status, with NO real counts. empty -> 0; low -> the LOW-ratio of
+// max; full -> omit (gSt returns "full" when the record is absent). Keeps
+// GuestMenu's availability + substitution logic identical, zero count leakage.
+function synthInvFromStatus(ings, statusMap) {
+  const out = {};
+  (ings || []).forEach(g => {
+    if (!g || !g.id) return;
+    const st = (statusMap || {})[g.id];
+    if (!st || st === "full") return;
+    const whole = (g.unit === "whole" || g.qw != null);
+    const mx = whole ? (g.qw || 12) : ((g.ml || 0) * (g.qty || 1));
+    const field = whole ? "rw" : "rm";
+    if (st === "empty") out[g.id] = { [field]: 0 };
+    else if (st === "low") out[g.id] = { [field]: mx * LOW };
+  });
+  return out;
+}
+
+// Assemble the public-safe snapshot payload (the `menu` jsonb). Carries EXACTLY
+// what GuestMenu renders from, ings sanitized + inv reduced to status. Sensitive
+// keys (markup, equip, defaults, staff, history, raw orders/inv, tooling) are
+// excluded by never being included.
+function buildPublicMenuPayload(s) {
+  return {
+    v: 1,
+    sub: s.sub, intro: s.intro, season: s.season,
+    menu: s.menu,
+    ings: (s.ings || []).map(sanitizeIngForPublish),
+    invStatus: buildPublicInvStatus(s.ings, s.inv),
+    glassware: s.glassware,
+    selections: s.selections,
+    featured: s.featured,
+    curated: s.curated,
+    beerSelections: s.beerSelections, beerFeatured: s.beerFeatured,
+    wineSelections: s.wineSelections, wineFeatured: s.wineFeatured,
+    ordersOpen: s.ordersOpen !== false
+  };
+}
+
+// PUBLISH (authed head): upsert the snapshot to published_menu. RLS gates this
+// to the head. publish_token is OMITTED so the server default generates it once
+// and keeps it stable across republishes; we read it back via return=representation.
+async function _publishMenuSnapshot(barName, payload) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/published_menu?on_conflict=tenant_id`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_ANON,
+      Authorization: _authHeader(),
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=representation"
+    },
+    body: JSON.stringify({
+      tenant_id: TENANT_ID,
+      bar_name: (barName || "The Interim"),
+      menu: payload,
+      published_at: new Date().toISOString()
+    })
+  });
+  if (!r.ok) throw new Error("publish failed: " + r.status);
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows[0] : rows;
+}
+
+// GUEST READ (anon): the published snapshot via the SECURITY DEFINER RPC — the
+// only guest path. Returns { bar_name, menu, featured, published_at } or null.
+async function _fetchPublishedMenu(token) {
+  if (!token) return null;
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_published_menu`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_ANON, Authorization: _authHeader(), "Content-Type": "application/json" },
+      body: JSON.stringify({ p_token: token })
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return (data && typeof data === "object") ? data : null;
+  } catch (e) { return null; }
+}
+
+// Head-only: read this bar's own publish_token + published_at (members-read RLS)
+// so the Settings indicator shows the token to copy into config and the last
+// publish time, persisting across reloads.
+async function _fetchOwnPublishedMeta() {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/published_menu?tenant_id=eq.${encodeURIComponent(TENANT_ID)}&select=publish_token,published_at`, {
+      headers: { apikey: SUPABASE_ANON, Authorization: _authHeader() }
+    });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    return (Array.isArray(rows) && rows[0]) ? rows[0] : null;
+  } catch (e) { return null; }
+}
+
 // Format elapsed time since a timestamp in human-friendly d/h/m units.
 // Examples: "just now", "1 min ago", "59 min ago", "1 hr ago",
 // "1 hr 1 min ago", "23 hr 59 min ago", "1 day ago", "1 day 1 hr ago",
@@ -18198,6 +18332,7 @@ function BarView({
   onAddCocktailsToMenu, onStockIngredient, onStockIngredients,
   onUpdateGlassware, onUpdateEquipment, onUpdateBarName, onUpdateHeadPin, onUpdateStaff, onUpdateSub, onUpdateIntro, onUpdateSeason, onUpdateSelections, onUpdateFeatured, onUpdateDefaults,
   ordersOpen, onUpdateOrdersOpen,
+  onPublishMenu, lastPublishedAt, publishedToken,
   onUpdateBeerSelections, onUpdateBeerFeatured, onUpdateWineSelections, onUpdateWineFeatured, onUpdateSpiritSelections,
   onClearOrders, onRefresh
 }) {
@@ -18522,6 +18657,29 @@ function BarView({
           E("button", { className: "sv", onClick: () => onUpdateOrdersOpen(!ordersOpen), style: { marginTop: 9 } },
             ordersOpen ? "Close the Bar" : "Open the Bar"
           )
+        ),
+        E("div", { className: "st2 sf" }, "Published Menu"),
+        E("div", null,
+          E("div", { className: "fl3" }, "Guest Menu Snapshot"),
+          E("div", { style: { fontFamily: "'Cormorant Garamond',serif", fontStyle: "italic", color: "var(--dim)", fontSize: ".88rem", letterSpacing: ".03em" } },
+            "Publishing pushes a public-safe copy of the menu — recipes and availability, never costs or inventory — to guest devices. Curate first, then publish."
+          ),
+          lastPublishedAt
+            ? E("div", { style: { fontFamily: "'Cormorant Garamond',serif", fontStyle: "italic", color: "var(--gold)", fontSize: ".9rem", marginTop: 6, letterSpacing: ".03em" } },
+                "Last published " + tAgo(Date.parse(lastPublishedAt)) + ".")
+            : E("div", { style: { fontFamily: "'Cormorant Garamond',serif", fontStyle: "italic", color: "var(--red)", fontSize: ".9rem", marginTop: 6, letterSpacing: ".03em" } },
+                "Not yet published — guests see the default menu until you publish."),
+          E("button", { className: "sv", style: { marginTop: 9 },
+            onClick: async () => { try { await onPublishMenu(); } catch (e) { alert("Publish failed — check your connection and that you're signed in as the head bartender."); } } },
+            lastPublishedAt ? "Re-publish Menu" : "Publish Menu"
+          ),
+          publishedToken
+            ? E("div", { style: { marginTop: 10 } },
+                E("div", { className: "fl3" }, "Menu Token"),
+                E("div", { style: { fontFamily: "monospace", fontSize: ".72rem", wordBreak: "break-all", color: "var(--dim)", background: "rgba(0,0,0,.15)", padding: "6px 8px", borderRadius: 4, marginTop: 4 } }, publishedToken),
+                E("div", { style: { fontFamily: "'Cormorant Garamond',serif", fontStyle: "italic", color: "var(--dim)", fontSize: ".8rem", marginTop: 4, letterSpacing: ".03em" } },
+                  "Paste this into config.js as publishToken so guest devices can load this menu."))
+            : null
         ),
         E("div", { className: "st2 sf" }, "Pricing"),
         E("div", null, E("div", { className: "fl3" }, "Pour Cost Markup Multiplier"),
@@ -19712,6 +19870,9 @@ function App() {
   // hours, branding, contact — read here but not yet surfaced in the UI.
   const [tenantSettings, setTenantSettings] = useState({});
   const [headPin, setHeadPin] = useState("1234");
+  // Phase 3b-1: published-menu indicator state (head Settings → Service).
+  const [lastPublishedAt, setLastPublishedAt] = useState(null);
+  const [publishedToken, setPublishedToken] = useState("");
   const [sub, setSub] = useState("Spring Selection");
   const [intro, setIntro] = useState("");
   // Pour-cost markup multiplier used to suggest a menu price from a cocktail's
@@ -19823,6 +19984,36 @@ function App() {
 
   // Initial load + polling
   const loadAll = useCallback(async () => {
+    // GUEST PATH (Phase 3b-1): an anonymous visitor has no app_state access on
+    // the shared backend, so guests read the public-safe snapshot via the
+    // capability-token RPC and never touch app_state. Maps the bundle into the
+    // same state GuestMenu renders from; inv is reconstructed to availability
+    // status only (no real counts ever reach the guest). Runs on the 3s poll
+    // too, so republishes (incl. open/close) surface within a cycle.
+    if (!_authSession || !_authSession.role) {
+      const snap = await _fetchPublishedMenu(PUBLISH_TOKEN);
+      const b = (snap && snap.menu && typeof snap.menu === "object") ? snap.menu : null;
+      if (b) {
+        if (typeof snap.bar_name === "string" && snap.bar_name) setBarName(snap.bar_name);
+        if (Array.isArray(b.menu)) setMenu(b.menu);
+        const gIngs = Array.isArray(b.ings) ? b.ings : [];
+        setIngs(gIngs);
+        setInv(synthInvFromStatus(gIngs, b.invStatus || {}));
+        if (Array.isArray(b.glassware)) setGlassware(b.glassware);
+        if (typeof b.sub === "string") setSub(b.sub);
+        if (typeof b.intro === "string") setIntro(b.intro);
+        if (typeof b.season === "string") setSeason(b.season);
+        if (b.selections && typeof b.selections === "object") setSelections(b.selections);
+        if (b.featured && typeof b.featured === "object") setFeatured(b.featured);
+        if (b.beerSelections && typeof b.beerSelections === "object") setBeerSelections(b.beerSelections);
+        if (b.beerFeatured && typeof b.beerFeatured === "object") setBeerFeatured(b.beerFeatured);
+        if (b.wineSelections && typeof b.wineSelections === "object") setWineSelections(b.wineSelections);
+        if (b.wineFeatured && typeof b.wineFeatured === "object") setWineFeatured(b.wineFeatured);
+        if (b.curated !== undefined) setCuratedMenu(b.curated);
+        setTenantSettings(ts => ({ ...ts, ordering_open: b.ordersOpen !== false }));
+      }
+      return; // guests never read app_state
+    }
     const [o, m, i, h, gw, st, n, p, sb, intr, gn, ss, sel, feat, eq, ud, bsel, bfeat, wsel, wfeat, ssel, mk, cur, dmode, dtags, lreg] = await Promise.all([
       gs("get", K.O), gs("get", K.M), gs("get", K.I), gs("get", K.H),
       gs("get", K.GW), gs("get", K.STAFF), gs("get", K.N), gs("get", K.P),
@@ -19899,6 +20090,12 @@ function App() {
     // the poll loop too, keeping the name in sync if changed elsewhere.
     const tset = await _supabaseGetTenantSettings();
     if (tset && typeof tset === "object") setTenantSettings(tset);
+    // Phase 3b-1: surface this bar's published-menu token + timestamp to the head.
+    const pubMeta = await _fetchOwnPublishedMeta();
+    if (pubMeta) {
+      if (pubMeta.published_at) setLastPublishedAt(pubMeta.published_at);
+      if (pubMeta.publish_token) setPublishedToken(pubMeta.publish_token);
+    }
     const tName = (tset && typeof tset.name === "string") ? tset.name.trim() : "";
     if (tName) setBarName(tName);
     else if (typeof n === "string") setBarName(n);
@@ -20611,10 +20808,39 @@ function App() {
         // replace. Optimistic local update; the head-only UPDATE RLS makes
         // this fail closed (silently, like the name save) for non-heads.
         ordersOpen,
+        lastPublishedAt, publishedToken,
+        // Phase 3b-1: publish the public-safe snapshot guests read. Builds the
+        // sanitized payload from current state, upserts published_menu (head RLS),
+        // stores the token + time for the Settings indicator.
+        onPublishMenu: async () => {
+          const row = await _publishMenuSnapshot(barName, buildPublicMenuPayload({
+            sub, intro, season, menu, ings, inv, glassware, selections, featured,
+            curated: curatedMenu, beerSelections, beerFeatured, wineSelections, wineFeatured,
+            ordersOpen
+          }));
+          if (row) {
+            setLastPublishedAt(row.published_at || new Date().toISOString());
+            if (row.publish_token) setPublishedToken(row.publish_token);
+          }
+          return row;
+        },
         onUpdateOrdersOpen: async (open) => {
           const next = { ...tenantSettings, ordering_open: !!open };
           setTenantSettings(next);
           await _supabaseSetTenantSettings(next);
+          // Auto-republish so the snapshot guests read reflects open/closed
+          // within a poll cycle (the menu-content publish stays explicit).
+          try {
+            const row = await _publishMenuSnapshot(barName, buildPublicMenuPayload({
+              sub, intro, season, menu, ings, inv, glassware, selections, featured,
+              curated: curatedMenu, beerSelections, beerFeatured, wineSelections, wineFeatured,
+              ordersOpen: !!open
+            }));
+            if (row) {
+              setLastPublishedAt(row.published_at || new Date().toISOString());
+              if (row.publish_token) setPublishedToken(row.publish_token);
+            }
+          } catch (e) {}
         },
         onUpdateHeadPin: p => persist(K.P, p, setHeadPin),
         onUpdateStaff: s => persist(K.STAFF, s, setStaff),
