@@ -19324,16 +19324,12 @@ function GuestMenu({
       const g = ings.find(i => i.id === ri.id);
       if (!g) return false;
       const it = inv[ri.id];
-      if (gSt(g, it) === "empty") {
-        // Check alternates
-        const alts = CAT_ALTS[g.c] || [g.c];
-        let foundAlt = false;
-        for (const altCat of alts) {
-          const altIng = ings.find(i => i.c === altCat && gSt(i, inv[i.id]) !== "empty");
-          if (altIng) { foundAlt = true; break; }
-        }
-        if (!foundAlt) return false;
-      }
+      // Guest menu shows a cocktail as UNAVAILABLE when its specified ingredient
+      // is out — no silent category substitution. The guest sees it greyed and
+      // can ask the bartender about a swap (an intentional feedback loop) rather
+      // than unknowingly being served a different spirit. Bartender/Discover
+      // views are unaffected — this is the guest-facing drinkAvailable only.
+      if (gSt(g, it) === "empty") return false;
     }
     return true;
   }
