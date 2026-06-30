@@ -9501,6 +9501,14 @@ const APP_STATE_CONFLICT = window.MISE_CONFIG.appStateConflict || "key";
 // guest path no-ops and the menu falls back to defaults (graceful pre-publish).
 const PUBLISH_TOKEN = window.MISE_CONFIG.publishToken || "";
 
+// Whether this deployment uses the PUBLISHED guest model (shared backend: guests
+// read get_published_menu, the head publishes snapshots) vs the legacy LIVE model
+// (legacy per-silo backend: anon reads app_state directly). Gates the guest read,
+// the Publish button, and auto-republish so the byte-identical client stays
+// backward-compatible — a legacy silo that omits this keeps its live guest menu.
+// Moves together with supabaseUrl + appStateConflict at a backend cutover.
+const GUEST_PUBLISHED = window.MISE_CONFIG.guestMenuMode === "published";
+
 async function fbSubmit({ rating, comment, cocktail_id, cocktail_name }) {
   if (!SUPABASE_URL || !SUPABASE_ANON) return null;
   if (!Number.isInteger(rating) || rating < 1 || rating > 5) return null;
@@ -18658,6 +18666,7 @@ function BarView({
             ordersOpen ? "Close the Bar" : "Open the Bar"
           )
         ),
+        GUEST_PUBLISHED && E(React.Fragment, null,
         E("div", { className: "st2 sf" }, "Published Menu"),
         E("div", null,
           E("div", { className: "fl3" }, "Guest Menu Snapshot"),
@@ -18680,7 +18689,7 @@ function BarView({
                 E("div", { style: { fontFamily: "'Cormorant Garamond',serif", fontStyle: "italic", color: "var(--dim)", fontSize: ".8rem", marginTop: 4, letterSpacing: ".03em" } },
                   "Paste this into config.js as publishToken so guest devices can load this menu."))
             : null
-        ),
+        )),
         E("div", { className: "st2 sf" }, "Pricing"),
         E("div", null, E("div", { className: "fl3" }, "Pour Cost Markup Multiplier"),
           E("div", { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
@@ -19980,13 +19989,17 @@ function App() {
 
   // Initial load + polling
   const loadAll = useCallback(async () => {
-    // GUEST PATH (Phase 3b-1): an anonymous visitor has no app_state access on
-    // the shared backend, so guests read the public-safe snapshot via the
-    // capability-token RPC and never touch app_state. Maps the bundle into the
-    // same state GuestMenu renders from; inv is reconstructed to availability
-    // status only (no real counts ever reach the guest). Runs on the 3s poll
-    // too, so republishes (incl. open/close) surface within a cycle.
-    if (!_authSession || !_authSession.role) {
+    // GUEST PATH (Phase 3b-1): on the PUBLISHED model (shared backend) an
+    // anonymous visitor has no app_state access, so guests read the public-safe
+    // snapshot via the capability-token RPC and never touch app_state. Maps the
+    // bundle into the same state GuestMenu renders from; inv is reconstructed to
+    // availability status only (no real counts ever reach the guest). Runs on the
+    // 3s poll too, so republishes (incl. open/close) surface within a cycle.
+    // GATED on GUEST_PUBLISHED: a legacy silo (live model) skips this and falls
+    // through to the app_state reads below, which anon CAN do there — preserving
+    // the existing live guest menu. Without this gate, deploying to a legacy silo
+    // would break its guest menu (no published_menu table -> default menu).
+    if ((!_authSession || !_authSession.role) && GUEST_PUBLISHED) {
       const snap = await _fetchPublishedMenu(PUBLISH_TOKEN);
       const b = (snap && snap.menu && typeof snap.menu === "object") ? snap.menu : null;
       if (b) {
@@ -20761,6 +20774,7 @@ function App() {
   const _doPublishRef = useRef(null);
   useEffect(() => {
     _doPublishRef.current = async () => {
+      if (!GUEST_PUBLISHED) return;
       if (!_authSession || _authSession.role !== "head") return;
       try {
         const row = await _publishMenuSnapshot(barName, buildPublicMenuPayload({
@@ -20776,6 +20790,7 @@ function App() {
     };
   });
   const scheduleRepublish = useCallback(() => {
+    if (!GUEST_PUBLISHED) return;
     if (!_authSession || _authSession.role !== "head") return;
     if (_republishTimer.current) clearTimeout(_republishTimer.current);
     _republishTimer.current = setTimeout(() => {
