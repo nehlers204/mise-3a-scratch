@@ -9833,7 +9833,46 @@ async function _fetchPublishedMenu(token) {
   } catch (e) { return null; }
 }
 
-// Head-only: read this bar's own publish_token + published_at (members-read RLS)
+// Apothecary-toned display handle for a guest on the published (shared-backend)
+// surface. The server-minted guest_token is the real identity; this is only the
+// label shown to the guest and on the bartender ticket. ~1300 combinations —
+// collisions are possible but rare, and the token disambiguates in data.
+function genGuestHandle() {
+  const A = ["Smoked","Bitter","Gilded","Velvet","Dusky","Amber","Crimson","Wild",
+    "Burnt","Candied","Spiced","Charred","Steeped","Muddled","Toasted","Salted",
+    "Honeyed","Ashen","Sable","Ember","Hazel","Oaken","Dried","Brambled","Frosted",
+    "Inked","Sloe","Russet","Umber","Clouded","Twilit","Brined","Cured","Wintered",
+    "Sunlit","Dappled"];
+  const N = ["Plum","Thyme","Fennel","Sage","Cassis","Juniper","Clove","Anise","Rue",
+    "Sorrel","Bramble","Cedar","Birch","Myrrh","Sumac","Hyssop","Vetiver","Orris",
+    "Angelica","Gentian","Wormwood","Elder","Quince","Medlar","Cardamom","Saffron",
+    "Fig","Damson","Bergamot","Tonka","Marasca","Pimento","Lovage","Tansy","Yarrow","Nettle"];
+  return A[Math.floor(Math.random() * A.length)] + " " + N[Math.floor(Math.random() * N.length)];
+}
+
+// Guest order submission on the published surface (anon RPC). Mints/reuses the
+// guest_token server-side and inserts one row per drink. Returns
+// { guest_token, order_ids } on success, or NULL on any failure so the caller
+// can surface an honest error instead of a false confirmation.
+async function _submitGuestOrder(items, guestToken, guestHandle) {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/submit_guest_order`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_ANON, Authorization: _authHeader(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        p_token: PUBLISH_TOKEN,
+        p_items: items,
+        p_guest_name: null,
+        p_guest_token: guestToken || null,
+        p_guest_handle: guestHandle || null
+      })
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return (data && typeof data === "object" && data.guest_token) ? data : null;
+  } catch (e) { return null; }
+}
+
 // so the Settings indicator shows the token to copy into config and the last
 // publish time, persisting across reloads.
 async function _fetchOwnPublishedMeta() {
@@ -19241,6 +19280,7 @@ function GuestMenu({
   const [cart, setCart] = useState({}); // { drinkId|wineId|beerId : { qty, kind: "cocktail"|"wine"|"beer" } }
   const [guest, setGuest] = useState("");
   const [confirmed, setConfirmed] = useState(false);
+  const [orderError, setOrderError] = useState("");
   // If the guest's typed name was auto-disambiguated (e.g. "Alex" → "Alex (2)"
   // because another Alex has live orders), this holds the assigned name so we
   // can surface it in the confirmation banner. Cleared whenever the banner
@@ -19387,11 +19427,18 @@ function GuestMenu({
     // differ from the entered name if auto-disambiguation kicked in).
     const submittedAs = guest.trim();
     Promise.resolve(onSendOrder({ guest: submittedAs, items: orders })).then(finalName => {
+      // NULL = the published-surface RPC failed. Surface an honest error and keep
+      // the cart intact so the guest can retry; never flash a false confirmation.
+      if (finalName === null) {
+        setOrderError("Couldn't reach the bar. Please try again.");
+        setTimeout(() => setOrderError(""), 5000);
+        return;
+      }
       setConfirmedAsName(finalName || submittedAs);
+      setConfirmed(true);
+      setCart({});
+      setTimeout(() => { setConfirmed(false); setConfirmedAsName(""); }, 5000);
     });
-    setConfirmed(true);
-    setCart({});
-    setTimeout(() => { setConfirmed(false); setConfirmedAsName(""); }, 5000);
   }
 
   return E(React.Fragment, null,
@@ -19610,8 +19657,11 @@ function GuestMenu({
                   })
                 ),
                 E("div", { className: "onr" },
-                  E("input", { className: "oi", placeholder: "Your name", value: guest, onChange: ev => setGuest(ev.target.value) }),
-                  E("button", { className: "ob", onClick: place, disabled: !guest.trim() }, "Place Order")
+                  GUEST_PUBLISHED
+                    ? (activeGuest ? E("div", { className: "oi", style: { display: "flex", alignItems: "center", opacity: 0.85 } }, "Ordering as ", E("b", { style: { marginLeft: 4 } }, activeGuest)) : null)
+                    : E("input", { className: "oi", placeholder: "Your name", value: guest, onChange: ev => setGuest(ev.target.value) }),
+                  E("button", { className: "ob", onClick: place, disabled: GUEST_PUBLISHED ? false : !guest.trim() }, "Place Order"),
+                  orderError ? E("div", { className: "oerr", style: { color: "#c0392b", fontSize: 13, flexBasis: "100%", marginTop: 6 } }, orderError) : null
                 )
               )
         )
@@ -19636,6 +19686,7 @@ function SpiritsPage({
   const [guest, setGuest] = useState("");
   const [confirmed, setConfirmed] = useState(false);
   const [confirmedAsName, setConfirmedAsName] = useState("");
+  const [orderError, setOrderError] = useState("");
 
   // Filter spirits on menu. Resolution:
   //   1. If spiritSelections has any curated ids, use those (preserves curation order).
@@ -19695,11 +19746,16 @@ function SpiritsPage({
     });
     const submittedAs = guest.trim();
     Promise.resolve(onSendOrder({ guest: submittedAs, items: orders })).then(finalName => {
+      if (finalName === null) {
+        setOrderError("Couldn't reach the bar. Please try again.");
+        setTimeout(() => setOrderError(""), 5000);
+        return;
+      }
       setConfirmedAsName(finalName || submittedAs);
+      setConfirmed(true);
+      setCart({});
+      setTimeout(() => { setConfirmed(false); setConfirmedAsName(""); }, 5000);
     });
-    setConfirmed(true);
-    setCart({});
-    setTimeout(() => { setConfirmed(false); setConfirmedAsName(""); }, 5000);
   }
 
   function ingAvailable(g) {
@@ -19804,8 +19860,11 @@ function SpiritsPage({
                   })
                 ),
                 E("div", { className: "onr" },
-                  E("input", { className: "oi", placeholder: "Your name", value: guest, onChange: ev => setGuest(ev.target.value) }),
-                  E("button", { className: "ob", onClick: place, disabled: !guest.trim() }, "Place Order")
+                  GUEST_PUBLISHED
+                    ? (activeGuest ? E("div", { className: "oi", style: { display: "flex", alignItems: "center", opacity: 0.85 } }, "Ordering as ", E("b", { style: { marginLeft: 4 } }, activeGuest)) : null)
+                    : E("input", { className: "oi", placeholder: "Your name", value: guest, onChange: ev => setGuest(ev.target.value) }),
+                  E("button", { className: "ob", onClick: place, disabled: GUEST_PUBLISHED ? false : !guest.trim() }, "Place Order"),
+                  orderError ? E("div", { className: "oerr", style: { color: "#c0392b", fontSize: 13, flexBasis: "100%", marginTop: 6 } }, orderError) : null
                 )
               )
         )
@@ -19958,6 +20017,23 @@ function App() {
       if (g) localStorage.setItem("ti_active_guest", g);
       else localStorage.removeItem("ti_active_guest");
     } catch (e) { /* localStorage unavailable; in-memory only is the fallback */ }
+  }, []);
+
+  // Published surface only: the server-minted guest_token is the durable identity
+  // (per-device, persisted). On this path activeGuest holds the apothecary HANDLE
+  // (the display label); guestToken holds the hidden identity used to fetch this
+  // guest's messages (Increment C). Both replay on reorder so all a guest's
+  // orders attribute to one identity with no name-collision logic.
+  const [guestToken, setGuestToken] = useState(() => {
+    try { return localStorage.getItem("ti_guest_token") || ""; }
+    catch (e) { return ""; }
+  });
+  const setGuestTokenPersisted = useCallback((t) => {
+    setGuestToken(t);
+    try {
+      if (t) localStorage.setItem("ti_guest_token", t);
+      else localStorage.removeItem("ti_guest_token");
+    } catch (e) { /* in-memory only fallback */ }
   }, []);
 
   // Theme load + persist
@@ -20349,6 +20425,23 @@ function App() {
 
   // === Order placement ===
   async function handleSendOrder({ guest, items }) {
+    // PUBLISHED surface (shared backend): server mints/reuses the guest_token and
+    // inserts one row per drink. No typed name, no disambiguation — the token is
+    // the identity, the apothecary handle is the label (reused across a device's
+    // orders). Returns the handle on success, or NULL on failure so the caller
+    // shows an honest error instead of a false confirmation.
+    if (GUEST_PUBLISHED) {
+      const handle = activeGuest || genGuestHandle();
+      const payload = items.map(it => ({ drinkId: it.id, kind: it.kind, rocks: it.rocks }));
+      const res = await _submitGuestOrder(payload, guestToken, handle);
+      if (!res) return null;
+      setGuestTokenPersisted(res.guest_token);
+      setActiveGuestPersisted(handle);
+      return handle;
+    }
+
+    // LEGACY surface (per-silo backend): orders live in app_state.ti_o7; the
+    // free-text name + disambiguation model is preserved unchanged.
     const fresh = await gs("get", K.O) || [];
     const existing = fresh;
     const finalGuest = disambiguateGuestName(guest, existing);
