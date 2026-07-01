@@ -19265,6 +19265,7 @@ function GuestMenu({
   beerSelections, beerFeatured, wineSelections, wineFeatured,
   guestNotif, onAckNotif,
   onSendOrder, onOpenSpirits, onGoBar,
+  activeGuest,
   theme, onTheme,
   // Operating hours: false when the head bartender has closed the bar via
   // Settings → Service. The menu stays browsable; every order affordance
@@ -19676,6 +19677,7 @@ function SpiritsPage({
   barName, ings, inv, spiritSelections,
   guestNotif, onAckNotif,
   onSendOrder, onBack,
+  activeGuest,
   theme, onTheme,
   // Operating hours — same contract as GuestMenu's ordersOpen prop: the
   // spirits page has its own independent cart, so it gates its own
@@ -21040,6 +21042,7 @@ function App() {
       barName, ings, inv, spiritSelections,
       guestNotif: myGuestNotif, onAckNotif: handleAckNotif,
       onSendOrder: handleSendOrder,
+      activeGuest,
       onBack: () => setView("guest"),
       theme, onTheme: setTheme,
       ordersOpen
@@ -21057,6 +21060,7 @@ function App() {
     beerSelections, beerFeatured, wineSelections, wineFeatured,
     guestNotif: myGuestNotif, onAckNotif: handleAckNotif,
     onSendOrder: handleSendOrder,
+    activeGuest,
     onOpenSpirits: () => setView("spirits"),
     onGoBar: () => setView("pin"),
     theme, onTheme: setTheme,
