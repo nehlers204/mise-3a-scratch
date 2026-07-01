@@ -19417,7 +19417,7 @@ function GuestMenu({
     // Defense in depth: the order panel is unmounted while closed, but the
     // flag can flip between render and tap. Never submit while closed.
     if (!ordersOpen) return;
-    if (!guest.trim() || cartTotal === 0) return;
+    if ((!GUEST_PUBLISHED && !guest.trim()) || cartTotal === 0) return;
     const orders = [];
     Object.entries(cart).forEach(([id, e]) => {
       for (let i = 0; i < e.qty; i++) {
@@ -19739,7 +19739,7 @@ function SpiritsPage({
 
   function place() {
     if (!ordersOpen) return;
-    if (!guest.trim() || cartTotal === 0) return;
+    if ((!GUEST_PUBLISHED && !guest.trim()) || cartTotal === 0) return;
     const orders = [];
     Object.entries(cart).forEach(([id, e]) => {
       for (let i = 0; i < e.qty; i++) {
