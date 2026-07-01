@@ -9873,6 +9873,50 @@ async function _submitGuestOrder(items, guestToken, guestHandle) {
   } catch (e) { return null; }
 }
 
+// --- Bartender order board on the published (shared) backend — Increment B ---
+// Orders live in the `orders` table (one row per drink), not app_state.ti_o7.
+// Normalize a table row into the exact shape the board already renders from, so
+// the board component itself needs no per-backend branching.
+function _normOrderRow(row) {
+  const it = (row && row.items) || {};
+  return {
+    id: row.id,
+    drinkId: it.drinkId,
+    kind: it.kind,
+    rocks: it.rocks,
+    guest: row.guest_handle || row.guest_name || "Guest",
+    ts: row.created_at ? Date.parse(row.created_at) : Date.now(),
+    claimedBy: row.claimed_by || null,
+    claimedByName: row.claimed_by_name || null,
+    bartenderId: row.claimed_by || null, // reports/history attribution key
+    status: row.status
+  };
+}
+
+// Active board = received + making, oldest first (authed; RLS members-read).
+async function _fetchOrdersActive() {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/orders?tenant_id=eq.${encodeURIComponent(TENANT_ID)}&status=in.(received,making)&order=created_at.asc&select=*`, {
+      headers: { apikey: SUPABASE_ANON, Authorization: _authHeader() }
+    });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    return Array.isArray(rows) ? rows.map(_normOrderRow) : null;
+  } catch (e) { return null; }
+}
+
+// History = served + cancelled, newest first, capped.
+async function _fetchOrdersHistory(limit) {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/orders?tenant_id=eq.${encodeURIComponent(TENANT_ID)}&status=in.(served,cancelled)&order=created_at.desc&limit=${limit || 500}&select=*`, {
+      headers: { apikey: SUPABASE_ANON, Authorization: _authHeader() }
+    });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    return Array.isArray(rows) ? rows.map(_normOrderRow) : null;
+  } catch (e) { return null; }
+}
+
 // so the Settings indicator shows the token to copy into config and the last
 // publish time, persisting across reloads.
 async function _fetchOwnPublishedMeta() {
@@ -20112,7 +20156,16 @@ function App() {
       gs("get", K.LOCALITY_REGION)
     ]);
     // Defensive: only accept arrays/objects of the right shape; otherwise keep defaults
-    if (Array.isArray(o)) setOrders(o);
+    // Orders board (Increment B): on the published/shared backend the bartender's
+    // board comes from the `orders` table (authed, normalized), not app_state.ti_o7.
+    // Legacy silos keep the K.O read unchanged. Guests never reach here (they
+    // return early on the published guest branch above).
+    if (GUEST_PUBLISHED && _authSession && _authSession.role) {
+      const active = await _fetchOrdersActive();
+      if (Array.isArray(active)) setOrders(active);
+    } else if (Array.isArray(o)) {
+      setOrders(o);
+    }
     if (Array.isArray(m)) {
       // Merge stored menu with DEFAULT_MENU so new cocktails ship into existing
       // installs without losing the bartender's customizations to existing ones.
@@ -20164,7 +20217,12 @@ function App() {
     } else {
       setInv(buildInv(ingsToUse));
     }
-    if (Array.isArray(h)) setHistory(h);
+    if (GUEST_PUBLISHED && _authSession && _authSession.role) {
+      const hist = await _fetchOrdersHistory(500);
+      if (Array.isArray(hist)) setHistory(hist);
+    } else if (Array.isArray(h)) {
+      setHistory(h);
+    }
     if (Array.isArray(gw)) setGlassware(gw);
     // Equipment: array of { id, name, quantity, notes }. If shape doesn't
     // match, keep defaults rather than scrambling state.
